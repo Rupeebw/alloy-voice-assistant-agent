@@ -1,9 +1,11 @@
 import base64
 from threading import Lock, Thread
-
+import time
+import numpy as np  # Changed to 'np' for consistency with numpy convention
 import cv2
 import openai
-from cv2 import VideoCapture, imencode
+from PIL import ImageGrab
+from cv2 import imencode
 from dotenv import load_dotenv
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.schema.messages import SystemMessage
@@ -11,17 +13,14 @@ from langchain_community.chat_message_histories import ChatMessageHistory
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
 from pyaudio import PyAudio, paInt16
 from speech_recognition import Microphone, Recognizer, UnknownValueError
 
 load_dotenv()
 
-
-class WebcamStream:
+class DesktopScreenshot:
     def __init__(self):
-        self.stream = VideoCapture(index=0)
-        _, self.frame = self.stream.read()
+        self.screenshot = None
         self.running = False
         self.lock = Lock()
 
@@ -30,37 +29,37 @@ class WebcamStream:
             return self
 
         self.running = True
-
         self.thread = Thread(target=self.update, args=())
         self.thread.start()
         return self
 
     def update(self):
         while self.running:
-            _, frame = self.stream.read()
+            try:
+                screenshot = ImageGrab.grab()
+                screenshot = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
 
-            self.lock.acquire()
-            self.frame = frame
-            self.lock.release()
+                with self.lock:
+                    self.screenshot = screenshot
+            except Exception as e:
+                print(f"Error capturing screenshot: {e}")
+
+            time.sleep(0.1)  # Pause to reduce CPU usage
 
     def read(self, encode=False):
-        self.lock.acquire()
-        frame = self.frame.copy()
-        self.lock.release()
+        with self.lock:
+            screenshot = self.screenshot.copy() if self.screenshot is not None else None
 
-        if encode:
-            _, buffer = imencode(".jpeg", frame)
+        if encode and screenshot is not None:
+            _, buffer = imencode(".jpeg", screenshot)
             return base64.b64encode(buffer)
 
-        return frame
+        return screenshot
 
     def stop(self):
         self.running = False
         if self.thread.is_alive():
             self.thread.join()
-
-    def __exit__(self, exc_type, exc_value, exc_traceback):
-        self.stream.release()
 
 
 class Assistant:
@@ -84,16 +83,22 @@ class Assistant:
             self._tts(response)
 
     def _tts(self, response):
-        player = PyAudio().open(format=paInt16, channels=1, rate=24000, output=True)
+        try:
+            player = PyAudio().open(format=paInt16, channels=1, rate=24000, output=True)
 
-        with openai.audio.speech.with_streaming_response.create(
-            model="tts-1",
-            voice="alloy",
-            response_format="pcm",
-            input=response,
-        ) as stream:
-            for chunk in stream.iter_bytes(chunk_size=1024):
-                player.write(chunk)
+            with openai.audio.speech.with_streaming_response.create(
+                model="tts-1",
+                voice="shimmer",
+                response_format="pcm",
+                input=response,
+            ) as stream:
+                for chunk in stream.iter_bytes(chunk_size=1024):
+                    player.write(chunk)
+        except Exception as e:
+            print(f"Error during TTS: {e}")
+        finally:
+            player.stop_stream()
+            player.close()
 
     def _create_inference_chain(self, model):
         SYSTEM_PROMPT = """
@@ -134,13 +139,9 @@ class Assistant:
         )
 
 
-webcam_stream = WebcamStream().start()
+desktop_screenshot = DesktopScreenshot().start()
 
-model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest")
-
-# You can use OpenAI's GPT-4o model instead of Gemini Flash
-# by uncommenting the following line:
-# model = ChatOpenAI(model="gpt-4o")
+model = ChatOpenAI(model="gpt-4o")
 
 assistant = Assistant(model)
 
@@ -148,8 +149,7 @@ assistant = Assistant(model)
 def audio_callback(recognizer, audio):
     try:
         prompt = recognizer.recognize_whisper(audio, model="base", language="english")
-        assistant.answer(prompt, webcam_stream.read(encode=True))
-
+        assistant.answer(prompt, desktop_screenshot.read(encode=True))
     except UnknownValueError:
         print("There was an error processing the audio.")
 
@@ -162,10 +162,12 @@ with microphone as source:
 stop_listening = recognizer.listen_in_background(microphone, audio_callback)
 
 while True:
-    cv2.imshow("webcam", webcam_stream.read())
+    screenshot = desktop_screenshot.read()
+    if screenshot is not None:
+        cv2.imshow("Desktop", screenshot)
     if cv2.waitKey(1) in [27, ord("q")]:
         break
 
-webcam_stream.stop()
+desktop_screenshot.stop()
 cv2.destroyAllWindows()
 stop_listening(wait_for_stop=False)

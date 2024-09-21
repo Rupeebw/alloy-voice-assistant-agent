@@ -18,6 +18,12 @@ $ pip install -U pip
 $ pip install -r requirements.txt
 ```
 
+brew install portaudio
+brew link portaudio
+
+pip install pyaudio
+
+
 Run the assistant:
 
 ```
